@@ -1,0 +1,101 @@
+--data dari tabel sample-orders isinya order_date, order_id, customer, grand_total
+WITH data_source AS(
+SELECT *
+FROM `authentic-codex-276407.rheza_playground.sample-orders`)
+
+--asumsikan hanya ingin melihat data dengan batas waktu 2 tahun dan sekarang tanggal 2015-01-01
+, max2year AS(
+SELECT *
+FROM data_source
+WHERE CAST(DATE_DIFF(DATE '2015-01-01', order_date, DAY) AS INT64) <730)
+
+--cari kapan terakhir customernya berkunjung
+, recency AS(
+SELECT customer, MIN(CAST(DATE_DIFF(DATE '2015-01-01', order_date, DAY) AS INT64)) AS last_buy
+FROM max2year
+GROUP BY customer)
+
+--quantile...
+,recency_q AS(
+SELECT 
+  last_buy[OFFSET(25)]AS q1,
+  last_buy[OFFSET(50)]AS q2,
+  last_buy[OFFSET(75)]AS q3
+FROM (SELECT APPROX_QUANTILES(last_buy,100) AS last_buy FROM recency))
+
+--ngitung R berdasarkan quartilenya, semakin besar R artinya dia udah lama tidak mengunjungi toko jadi nilai R terbesar ada di R<=q1
+, rpoint AS(
+SELECT *,
+CASE WHEN last_buy <= (SELECT q1 FROM recency_q) THEN 4
+     WHEN last_buy <= (SELECT q2 FROM recency_q) AND last_buy > (SELECT q1 FROM recency_q) THEN 3
+     WHEN last_buy <= (SELECT q3 FROM recency_q) AND last_buy > (SELECT q2 FROM recency_q) THEN 2
+     ELSE 1 END AS R
+FROM recency)
+
+--jumlah uang yang dihabiskan customer
+, monetary AS(
+SELECT customer, SUM(grand_total) AS total_buy
+FROM max2year
+GROUP BY customer)
+
+--quantile...
+, monetary_q AS(
+SELECT 
+  total_buy[OFFSET(25)]AS q1,
+  total_buy[OFFSET(50)]AS q2,
+  total_buy[OFFSET(75)]AS q3
+FROM (SELECT APPROX_QUANTILES(total_buy,100) AS total_buy FROM monetary ))
+
+--ngitung M berdasarkan jumlah uang yang dihabiskan 
+, mpoint AS(
+SELECT *,
+CASE WHEN total_buy <= (SELECT q1 FROM monetary_q) THEN 1
+     WHEN total_buy <= (SELECT q2 FROM monetary_q) AND total_buy > (SELECT q1 FROM monetary_q) THEN 2
+     WHEN total_buy <= (SELECT q3 FROM monetary_q) AND total_buy > (SELECT q2 FROM monetary_q) THEN 3
+     ELSE 4 END AS M
+FROM monetary)
+
+--cari seberapa sering customer mengunjungi toko
+, frequency AS(
+SELECT customer, count(order_id) AS visit_count
+FROM max2year
+GROUP BY customer)
+
+
+--quantile...
+, frequency_q AS(
+SELECT 
+  visit_count[OFFSET(25)]AS q1,
+  visit_count[OFFSET(50)]AS q2,
+  visit_count[OFFSET(75)]AS q3
+FROM (SELECT APPROX_QUANTILES(visit_count,100) AS visit_count FROM frequency ))
+
+--ngitung F berdasarkan frekuensi mengunjungi toko
+, fpoint AS(
+SELECT *,
+CASE WHEN visit_count <= (SELECT q1 FROM frequency_q) THEN 1
+     WHEN visit_count <= (SELECT q2 FROM frequency_q) AND visit_count > (SELECT q1 FROM frequency_q) THEN 2
+     WHEN visit_count <= (SELECT q3 FROM frequency_q) AND visit_count > (SELECT q2 FROM frequency_q) THEN 3
+     ELSE 4 END AS F
+FROM frequency)
+
+-- perhitungan RFM
+,rfmpoint AS(
+SELECT fpoint.customer, rpoint.R , fpoint.F , mpoint.M , 
+       CAST(CONCAT(rpoint.r,fpoint.f,mpoint.m) AS INT64) AS RFM,
+       (rpoint.r+fpoint.f+mpoint.m) AS RFM_point
+FROM fpoint,rpoint,mpoint
+WHERE fpoint.customer=mpoint.customer AND 
+      mpoint.customer=rpoint.customer AND
+      fpoint.customer=rpoint.customer) --ngapain pake syarat batas terakhir coba?
+
+--Main Query
+SELECT REGEXP_EXTRACT(customer, r"(.*?) .*?$") AS first_name,
+       REGEXP_EXTRACT(customer, r".*? (.*?$)") AS last_name,
+       customer AS full_name,
+       R, F, M, RFM, RFM_point
+FROM rfmpoint
+ORDER BY RFM_point DESC
+
+
+
